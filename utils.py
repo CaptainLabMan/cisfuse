@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
@@ -28,9 +29,20 @@ def fetch_file(link: str, output_dir: str, filename: str = None) -> Path:
     return output_path
 
 
-def remove_file(filepath, remove_file=0):
-    if remove_file == 1:
-        Path(filepath).unlink()
+def create_bam_index(bam_filepath):
+    bam_filepath = Path(bam_filepath)
+
+    index_paths = [
+        Path(str(bam_filepath) + ".bai"),
+        bam_filepath.with_suffix(".bai"),
+        Path(str(bam_filepath) + ".csi"),
+    ]
+
+    if not any(path.is_file() for path in index_paths):
+        subprocess.run(
+            ["samtools", "index", str(bam_filepath)],
+            check=True,
+        )
 
 
 def create_candidate_regions(
