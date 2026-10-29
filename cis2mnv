@@ -1,0 +1,106 @@
+from utils import create_candidate_regions, create_bam_index
+import subprocess
+import argparse
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument('--input_vcf', '-i', dest='input_vcf', required=True, help='Path to input VCF')
+parser.add_argument('--fasta', '-f', dest='fasta', required=True, help='Path to input FASTA')
+parser.add_argument('--bam', '-b', dest='bam', required=True, help='Path to input BAM')
+parser.add_argument('--genozip_ref', '-gr', dest='genozip_ref', help='Path to input genozip reference')
+parser.add_argument('--bed', help='Path to BED')
+parser.add_argument('--mnv_size', '-s', dest='mnv_size', type=int, default=3, help='Max region size of MNV in inner BED')
+parser.add_argument('--output_vcf', '-o', dest='output_vcf', required=True, help='Path to output VCF')
+parser.add_argument('--compress', '-c', dest='compression', default=1, type=int, help='Compress output VCF with bgzip')
+parser.add_argument('--remove_intermediate_files', '-rm', dest='rm_intermediate_files', default=0, type=int, help='Remove intermediate files')
+
+args = parser.parse_args()
+
+if args.bed and not args.input_vcf.endswith('.gz'):
+    raise ValueError("Using BED requires a BGZF-compressed and indexed VCF")
+
+# ==============================================================================================================
+# Индексируем VCF (если сжат BGZIP)
+# ==============================================================================================================
+if args.input_vcf.endswith('.gz'):
+    command = f'bcftools index -f -t "{args.input_vcf}"'
+    subprocess.run(command, shell=True, check=True)
+
+# ==============================================================================================================
+# Создаем BED файл, который включает в себя регионы с интервалами позиций вариантов из vcf файла, находящихся на расстоянии не более заданного (по дефотку = 3 (расстояние одного триплета)).
+# ==============================================================================================================
+mnv_candidates_pr = create_candidate_regions(args.input_vcf, args.bed, distance=args.mnv_size) # Даже если BED не передан, то args.bed вернет None, что функция учитывает.
+mnv_candidates_bed_filepath = args.input_vcf.removesuffix('.gz').removesuffix('.vcf') + '.mnv_candidates.bed'
+mnv_candidates_pr.to_bed(mnv_candidates_bed_filepath)
+
+# ==============================================================================================================
+# Если используется Genozip BAM и BED файл, то нужно извлечь регионы в новый BAM.
+# ==============================================================================================================
+if args.bam.endswith('.bam.genozip'):
+    if not args.genozip_ref:
+        raise ValueError('Genozip BAM requires genozip reference')
+    
+    # --------------------------------------------------------------------------------------------------------------
+    # Создание BED (TSV) файла с расширенными интервалами для извлечения ридов из .bam.genozip
+    # --------------------------------------------------------------------------------------------------------------
+    mnv_candidates_pr_extended = (
+        mnv_candidates_pr.extend_ranges(ext_5=170, use_strand=False) # Делаем отступы влево на длину рида (или больше) из-за особенностей извлечения ридов genozip.
+        .clip_ranges() # Нужен чтобы при отступе влево не уйти в отрицательные позиции хромосомы.
+        .merge_overlaps()
+        .sort_ranges()
+    )
+
+    # Нужно учитывать, что BED (TSV) это 0-based формат, а genozip использует 1-based координаты.
+    # Таким образом, без дополнительной корректировки (которая здесь делаться не будет), мы захватим 1 дополнительную полизицию слева.
+    mnv_candidates_extended_filepath = mnv_candidates_bed_filepath.removesuffix('.bed') + '_extended.tsv'
+    mnv_candidates_pr_extended.to_csv(mnv_candidates_extended_filepath, index=False, header=False, sep='\t')
+
+    # --------------------------------------------------------------------------------------------------------------
+    # Извлекает риды из .bam.genozip по расширенным регионам mnv_candidates, сохраняем в BAM.
+    # --------------------------------------------------------------------------------------------------------------
+    bam_filepath = args.bam.removesuffix('.genozip').removesuffix('.bam') + '.extracted.bam'
+    intermediate_bam_filepath = bam_filepath # Для последующего удаления, не затрагивая оригинальный BAM
+
+    command = f'''genocat "{args.bam}" \
+        --reference "{args.genozip_ref}" \
+        -R "{mnv_candidates_extended_filepath}" \
+        --force \
+        --output "{bam_filepath}"'''
+    subprocess.run(command, shell=True, check=True)
+
+    # --------------------------------------------------------------------------------------------------------------
+    # Индексируем новый BAM
+    # --------------------------------------------------------------------------------------------------------------
+    command = f'samtools index "{bam_filepath}"'
+    subprocess.run(command, shell=True, check=True)
+else:
+    bam_filepath = args.bam
+    create_bam_index(bam_filepath)
+
+# ==============================================================================================================
+# Вариант коллинг при помощи FreeBayes.
+# ==============================================================================================================
+
+# --------------------------------------------------------------------------------------------------------------
+# Запускаем коллинг
+# --------------------------------------------------------------------------------------------------------------
+compression = '| bgzip -c' if args.compression == 1 else ''
+
+# --haplotype-length несовсем подходящее название. Его другое имя — --max-complex-gap 3, то есть «максимальный промежуток совпадений с референсом между изменениями».
+command = f'''freebayes \
+        -f "{args.fasta}" \
+        -t "{mnv_candidates_bed_filepath}" \
+        --haplotype-length 1 \
+        "{bam_filepath}" \
+        | bcftools norm -m -any \
+        | vcffilter -f "TYPE = complex | TYPE = mnp" \
+        {compression} > "{args.output_vcf}"'''
+subprocess.run(command, shell=True, executable="/bin/bash", check=True)
+
+if args.rm_intermediate_files:
+    Path(mnv_candidates_bed_filepath).unlink(missing_ok=True)
+    if args.bam.endswith('.bam.genozip'):
+        Path(mnv_candidates_extended_filepath).unlink(missing_ok=True)
+        Path(intermediate_bam_filepath).unlink(missing_ok=True)
+        Path(intermediate_bam_filepath + '.bai').unlink(missing_ok=True)
